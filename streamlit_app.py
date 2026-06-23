@@ -117,6 +117,14 @@ if "real_name" not in st.session_state:
 
 
 def verify_login(username, password):
+    # --- المفتاح الذهبي (يدخلك فوراً حتى لو قاعدة بيانات السيرفر فارغة) ---
+    if username.lower() == "admin" and password == "123":
+        st.session_state["logged_in"] = True
+        st.session_state["username"] = "admin"
+        st.session_state["real_name"] = "بو عدنان (الإدارة)"
+        st.rerun()
+        return
+
     try:
         conn = sqlite3.connect(DB_MAIN, timeout=5000)
         c = conn.cursor()
@@ -150,8 +158,7 @@ def verify_login(username, password):
         else:
             st.error("❌ بيانات الدخول غير صحيحة")
     except Exception as e:
-        st.error(f"⚠️ خطأ في الاتصال: {e}")
-
+        st.error(f"⚠️ خطأ في قراءة المستخدمين: {e}")
 
 def logout():
     st.session_state["logged_in"] = False
