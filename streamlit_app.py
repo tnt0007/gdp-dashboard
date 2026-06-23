@@ -1,546 +1,195 @@
-import os
-import sqlite3
-from datetime import datetime, timedelta
-import gspread
-import pandas as pd
 import streamlit as st
-from google.oauth2.service_account import Credentials
-from PIL import Image
+from streamlit_gsheets import GSheetsConnection
+import pandas as pd
+from datetime import datetime
 
-# ==========================================
-# 1. إعدادات الصفحة وخط Tahoma
-# ==========================================
-st.set_page_config(
-    page_title="حركة السائقين | Al Hamad", page_icon="🚛", layout="wide"
-)
+# ══════════════════════════════════════════════════════════════
+# 1. إعدادات الصفحة
+# ══════════════════════════════════════════════════════════════
+st.set_page_config(page_title="حركة السائقين | Al Hamad ERP", page_icon="🚚", layout="wide")
 
-st.markdown(
-    """
+# إخفاء عناصر ستريملت الافتراضية ليعطي مظهر تطبيق مستقل
+st.markdown("""
     <style>
-    html, body, [class*="css"] { 
-        font-family: 'Tahoma', sans-serif !important; 
-    }
-    h1, h2, h3 { color: #f1c40f !important; text-align: center; }
-    label, .st-bb { font-size: 14px !important; color: #95a5a6 !important; font-weight: bold; }
-    .stButton>button { background-color: #2980b9; color: white; border-radius: 5px; width: 100%; font-weight: bold; border: none; }
-    .stButton>button:hover { background-color: #3498db; border: 1px solid #f1c40f; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ==========================================
-# 2. المسارات (OneDrive)
-# ==========================================
-USER_HOME = os.path.expanduser("~")
-_P1 = os.path.join(
-    USER_HOME,
-    "OneDrive - al hamad aluminum extrusions",
-    "22-02-2022",
-    "ERP",
-)
-_P2 = os.path.join(
-    USER_HOME,
-    "OneDrive - al hamad aluminum extrusions",
-    "haitham seddiqi's files - 22-02-2022",
-    "ERP",
-)
-_P3 = os.getcwd()
+# ══════════════════════════════════════════════════════════════
+# 2. دالة تنظيف الأرقام (حل مشكلة الأرقام العربية ٠١٢٣٤ في الجوالات)
+# ══════════════════════════════════════════════════════════════
+def clean_digits(val):
+    if not val: return ""
+    arabic_to_eng = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    return str(val).translate(arabic_to_eng).strip()
 
-BASE_DIR = _P3
-for _p in [_P1, _P2, _P3]:
-    if os.path.exists(_p) and os.path.exists(
-        os.path.join(_p, "confirmation_orders.db")
-    ):
-        BASE_DIR = _p
-        break
+# ══════════════════════════════════════════════════════════════
+# 3. قاعدة بيانات المستخدمين (الدخول بالرقم الوظيفي)
+# الصيغة: "الرقم الوظيفي": {"name": "اسم الموظف/ـة", "pin": "الرمز السري"}
+# ══════════════════════════════════════════════════════════════
+USERS_DB = {
+    "1000": {"name": "الإدارة | Admin", "pin": "0000"},
+    "2026": {"name": "Heitham Seddiqi", "pin": "2026"},
+    "1001": {"name": "Fatima", "pin": "1001"},
+    "1002": {"name": "Amna", "pin": "1002"},
+    "1003": {"name": "Maryam", "pin": "1003"}
+}
 
-DB_MAIN = os.path.join(BASE_DIR, "confirmation_orders.db")
-HR_DB = os.path.join(BASE_DIR, "factory_erp.db")
-EMP_PIC_DIR = os.path.join(BASE_DIR, "pic")
-LOGO_PATH = os.path.join(BASE_DIR, "logo2.jpg")
+# تهيئة الجلسة
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'current_user_id' not in st.session_state:
+    st.session_state['current_user_id'] = ''
+if 'current_user_name' not in st.session_state:
+    st.session_state['current_user_name'] = ''
 
-
-# ==========================================
-# 3. دوال جلب البيانات
-# ==========================================
-@st.cache_data(ttl=60)
-def get_customers():
-    try:
-        conn = sqlite3.connect(DB_MAIN)
-        c = conn.cursor()
-        c.execute("SELECT name FROM customers ORDER BY name")
-        res = [r[0] for r in c.fetchall()]
-        conn.close()
-        return [""] + res
-    except:
-        return [""]
-
-
-@st.cache_data(ttl=60)
-def get_drivers():
-    try:
-        conn = sqlite3.connect(HR_DB)
-        c = conn.cursor()
-        c.execute("PRAGMA table_info(employees)")
-        cols = [col[1].lower() for col in c.fetchall()]
-
-        filter_query = (
-            "SELECT name_ar, name FROM employees WHERE status NOT LIKE"
-            " '%كنسل%'"
-        )
-        for cand in ["designation", "department", "job_title"]:
-            if cand in cols:
-                filter_query += (
-                    f" AND ({cand} LIKE '%سائق%' OR {cand} LIKE '%driver%')"
-                )
-                break
-
-        c.execute(filter_query)
-        # جلب الاسم الإنجليزي (name) كأولوية
-        res = [str(r[1] if r[1] else r[0]) for r in c.fetchall()]
-        conn.close()
-        return [""] + res
-    except:
-        return [""]
-
-
-# ==========================================
-# 4. إدارة الجلسة وتحديث السجلات
-# ==========================================
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-if "username" not in st.session_state:
-    st.session_state["username"] = ""
-if "real_name" not in st.session_state:
-    st.session_state["real_name"] = ""
-
-
-def verify_login(username, password):
-    # --- المفتاح الذهبي (يدخلك فوراً حتى لو قاعدة بيانات السيرفر فارغة) ---
-    if username.lower() == "admin" and password == "123":
-        st.session_state["logged_in"] = True
-        st.session_state["username"] = "admin"
-        st.session_state["real_name"] = "بو عدنان (الإدارة)"
-        st.rerun()
-        return
-
-    try:
-        conn = sqlite3.connect(DB_MAIN, timeout=5000)
-        c = conn.cursor()
-        c.execute(
-            "SELECT role FROM app_users WHERE username=? AND password=?",
-            (username, password),
-        )
-        res = c.fetchone()
-        conn.close()
-
-        if res:
-            real_name = username
-            if os.path.exists(HR_DB):
-                try:
-                    c_hr = sqlite3.connect(HR_DB).cursor()
-                    c_hr.execute(
-                        "SELECT name_ar, name FROM employees WHERE emp_id=?",
-                        (username,),
-                    )
-                    r_hr = c_hr.fetchone()
-                    if r_hr:
-                        fn = r_hr[0] if r_hr[0] else r_hr[1]
-                        real_name = str(fn).split()[0] if fn else username
-                except:
-                    pass
-
-            st.session_state["logged_in"] = True
-            st.session_state["username"] = username
-            st.session_state["real_name"] = real_name
-            st.rerun()
-        else:
-            st.error("❌ بيانات الدخول غير صحيحة")
-    except Exception as e:
-        st.error(f"⚠️ خطأ في قراءة المستخدمين: {e}")
-
-def logout():
-    st.session_state["logged_in"] = False
-    st.session_state["username"] = ""
-    st.session_state["real_name"] = ""
-    st.rerun()
-
-
-def log_audit(action, details):
-    try:
-        conn = sqlite3.connect(DB_MAIN)
-        c = conn.cursor()
-        c.execute(
-            (
-                "INSERT INTO audit_trail (user, action, timestamp, details)"
-                " VALUES (?, ?, ?, ?)"
-            ),
-            (
-                st.session_state["real_name"],
-                action,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                details,
-            ),
-        )
-        conn.commit()
-        conn.close()
-    except:
-        pass
-
-
-# ==========================================
-# 5. شاشة تسجيل الدخول
-# ==========================================
-if not st.session_state["logged_in"]:
+# ══════════════════════════════════════════════════════════════
+# 4. بوابة الدخول المحمية (Login Gate)
+# ══════════════════════════════════════════════════════════════
+if not st.session_state['logged_in']:
     st.markdown("<br><br>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([2, 1, 2])
-    if os.path.exists(LOGO_PATH):
-        with col2:
-            st.image(LOGO_PATH, width=80, use_column_width=False)
-
-    st.title("نظام حركة السائقين")
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    
     with col2:
-        st.markdown(
-            "<h3 style='color: white;'>تسجيل الدخول | Login 🔐</h3>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("""
+        <div style='text-align: center; padding: 15px; background-color: #ffffff; border-radius: 8px; border: 1px solid #e1e8ed; margin-bottom: 20px;'>
+            <h2 style='color: #2c3e50; font-family: ae_AlMothnna, Arial; margin-bottom: 5px;'>نظام حركة السائقين</h2>
+            <p style='color: #7f8c8d; font-size: 14px; margin-top: 0;'>Al Hamad Aluminium Extrusions Factory</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
         with st.form("login_form"):
-            username_input = st.text_input("اسم المستخدم | Username")
-            password_input = st.text_input(
-                "كلمة المرور | Password", type="password"
-            )
-            submit_btn = st.form_submit_button("دخول")
+            emp_id_input = st.text_input("💳 الرقم الوظيفي | Employee ID:", placeholder="أدخل رقمك الوظيفي (مثال: 1000 أو 1001)")
+            pin_input = st.text_input("🔑 الرمز السري | PIN:", type="password", placeholder="أدخل الرمز السري")
+            
+            submit_btn = st.form_submit_button("دخول | Login 🔐", use_container_width=True)
+
             if submit_btn:
-                if username_input and password_input:
-                    verify_login(username_input, password_input)
-                else:
-                    st.warning("يرجى إدخال جميع البيانات.")
-
-# ==========================================
-# 6. الواجهة الرئيسية
-# ==========================================
-else:
-    with st.sidebar:
-        st.markdown(
-            "<h2 style='color:#f1c40f;'>الملف الشخصي</h2>",
-            unsafe_allow_html=True,
-        )
-        pic_found = False
-        for ext in [".jpg", ".jpeg", ".png"]:
-            pic_path = os.path.join(
-                EMP_PIC_DIR, f"{st.session_state['username']}{ext}"
-            )
-            if os.path.exists(pic_path):
-                try:
-                    img = Image.open(pic_path)
-                    st.image(img, width=120)
-                    pic_found = True
-                    break
-                except:
-                    pass
-        if not pic_found:
-            st.info("لا توجد صورة | No Image")
-        st.markdown(
-            f"### أهلاً بك | Welcome\n**{st.session_state['real_name']}**"
-        )
-        st.markdown("---")
-        st.button("🔒 تسجيل خروج | Logout", on_click=logout)
-
-    # ----------------------------------------------------
-    # 🔥 الاتصال المباشر بجوجل شيت عبر st.secrets
-    # ----------------------------------------------------
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    try:
-        creds = Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]), scopes=scopes
-        )
-        client = gspread.authorize(creds)
-        sheet = client.open("Drivers_Report").sheet1
-        sheet_data = sheet.get_all_values()
-        next_serial = len(sheet_data) if len(sheet_data) > 0 else 1
-        connection_status = True
-    except Exception as e:
-        st.error(f"⚠️ تعذر قراءة جدول (Drivers_Report): {e}")
-        connection_status = False
-
-    col_logo, col_title = st.columns([1, 4])
-    if os.path.exists(LOGO_PATH):
-        with col_logo:
-            st.image(LOGO_PATH, width=60)
-    with col_title:
-        st.title("🚛 إدخال حركة السائقين")
-
-    st.markdown("---")
-
-    if not connection_status:
-        st.stop()
-
-    # --- نموذج الإدخال الجديد ---
-    with st.form("driver_form", clear_on_submit=True):
-        st.markdown(
-            (
-                "<div style='text-align: left; color: #3498db; font-weight:"
-                f" bold;'>الرقم التسلسلي (SR#): {next_serial}</div>"
-            ),
-            unsafe_allow_html=True,
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            driver_name = st.selectbox(
-                "اسم السائق | NAME", options=get_drivers()
-            )
-        with c2:
-            car_no = st.text_input("رقم السيارة | CAR NO")
-        with c3:
-            date_input = st.date_input("التاريخ | DATE")
-        with c4:
-            customer = st.selectbox(
-                "العميل | CUSTOMER", options=get_customers()
-            )
-
-        c5, c6, c7, c8 = st.columns(4)
-        with c5:
-            do_no = st.text_input("رقم التوصيل | D.O NO")
-        with c6:
-            destination = st.text_input("الموقع | DESTINATION")
-        with c7:
-            time_from = st.time_input("الوقت من | TIME FROM")
-        with c8:
-            time_to = st.time_input("الوقت إلى | TIME TO")
-
-        notes = st.text_input("الملاحظات | NOTS")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        submit_button = st.form_submit_button(
-            label="💾 حفظ البيانات وإضافتها للجدول"
-        )
-
-    if submit_button:
-        if not driver_name or not car_no:
-            st.warning("⚠️ يرجى تعبئة اسم السائق ورقم السيارة على الأقل.")
-        else:
-            formatted_date = date_input.strftime("%d-%b-%Y")
-            f_time_from = time_from.strftime("%H:%M")
-            f_time_to = time_to.strftime("%H:%M")
-
-            t1 = datetime.combine(datetime.today(), time_from)
-            t2 = datetime.combine(datetime.today(), time_to)
-            if t2 < t1:
-                t2 += timedelta(days=1)
-            diff = t2 - t1
-            total_time = f"{diff.seconds//3600:02d}:{(diff.seconds//60)%60:02d}"
-
-            row_data = [
-                next_serial,
-                driver_name,
-                car_no,
-                formatted_date,
-                customer,
-                do_no,
-                destination,
-                f_time_from,
-                f_time_to,
-                total_time,
-                "",
-                notes,
-                "",
-                st.session_state["real_name"],
-            ]
-
-            with st.spinner("جاري الحفظ..."):
-                try:
-                    sheet.append_row(row_data)
-                    st.success("✅ تم حفظ البيانات بنجاح!")
+                clean_id = clean_digits(emp_id_input)
+                clean_pin = clean_digits(pin_input)
+                
+                if not clean_id or not clean_pin:
+                    st.warning("⚠️ يرجى إدخال الرقم الوظيفي والرمز السري.")
+                elif clean_id in USERS_DB and USERS_DB[clean_id]["pin"] == clean_pin:
+                    st.session_state['logged_in'] = True
+                    st.session_state['current_user_id'] = clean_id
+                    st.session_state['current_user_name'] = USERS_DB[clean_id]["name"]
                     st.rerun()
-                except Exception as e:
-                    st.error(f"❌ حدث خطأ: {e}")
+                else:
+                    st.error("❌ الرقم الوظيفي أو الرمز السري غير صحيح.")
+    
+    st.stop()
 
-    st.markdown("---")
-    st.markdown("### 📋 جدول سجلات السائقين (الأحدث أولاً)")
+# ══════════════════════════════════════════════════════════════
+# 5. واجهة البرنامج الرئيسية (بعد تسجيل الدخول الصحيح)
+# ══════════════════════════════════════════════════════════════
 
-    if len(sheet_data) > 1:
-        headers = sheet_data[0]
-        df = pd.DataFrame(sheet_data[1:], columns=headers)
-        df["Row_Num"] = range(2, len(sheet_data) + 1)
+# الترويسة العلوية ومعلومات المستخدم
+top1, top2 = st.columns([4, 1])
+with top1:
+    st.subheader(f"🚚 لوحة التحكم | أهلاً بك: **{st.session_state['current_user_name']}** (ID: {st.session_state['current_user_id']})")
+with top2:
+    if st.button("🚪 تسجيل خروج", use_container_width=True):
+        st.session_state['logged_in'] = False
+        st.session_state['current_user_id'] = ''
+        st.session_state['current_user_name'] = ''
+        st.rerun()
 
-        # عرض الجدول بشكل أنيق
-        st.dataframe(
-            df.iloc[::-1].drop(columns=["Row_Num"]), use_container_width=True
-        )
+st.markdown("---")
 
-        # --- قسم إدارة السجلات (التعديل والحذف) ---
-        with st.expander("⚙️ إدارة السجلات (تعديل / حذف)"):
-            record_list = (
-                df["Row_Num"].astype(str)
-                + " - "
-                + df.iloc[:, 1]
-                + " | "
-                + df.iloc[:, 3]
-            )
-            selected_rec = st.selectbox(
-                "اختر السجل المطلوب من القائمة:", [""] + record_list.tolist()
-            )
+# الاتصال بقاعدة بيانات Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-            if selected_rec:
-                row_idx = int(selected_rec.split(" - ")[0])
-                curr_data = df[df["Row_Num"] == row_idx].iloc[0]
+try:
+    df_log = conn.read(worksheet="Movement_Log", ttl=5)
+except Exception as e:
+    st.error(f"⚠️ يوجد مشكلة في قراءة السجل 'Movement_Log' من شيت الجوجل: {e}")
+    st.stop()
 
-                action = st.radio(
-                    "نوع الإجراء:",
-                    ["تعديل البيانات ✏️", "حذف السجل 🗑️"],
-                    horizontal=True,
-                )
+# قراءة قائمة السائقين من الشيت
+try:
+    df_drivers = conn.read(worksheet="Drivers", ttl=60)
+    drivers_list = df_drivers["Driver_Name"].dropna().tolist() if not df_drivers.empty else []
+except: drivers_list = []
+if not drivers_list: drivers_list = ["101 - JAMEEL", "102 - RAFIQ", "103 - KHALID"]
 
-                # --- برمجة الحذف ---
-                if action == "حذف السجل 🗑️":
-                    del_reason = st.text_input(
-                        "سبب الحذف (إلزامي للتأكيد):", key="del_reason"
-                    )
-                    if st.button("🚨 تأكيد الحذف نهائياً", type="primary"):
-                        if not del_reason.strip():
-                            st.error("⚠️ يجب إدخال سبب الحذف!")
-                        else:
-                            try:
-                                sheet.delete_rows(row_idx)
-                                log_audit(
-                                    "حذف سجل سائق",
-                                    (
-                                        f"Row: {row_idx} | SR:"
-                                        f" {curr_data.iloc[0]} | Reason:"
-                                        f" {del_reason}"
-                                    ),
-                                )
-                                st.success("تم الحذف بنجاح!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"خطأ في الحذف: {e}")
+# قراءة قائمة العملاء من الشيت
+try:
+    df_customers = conn.read(worksheet="Customers", ttl=60)
+    customers_list = df_customers["Customer_Name"].dropna().tolist() if not df_customers.empty else []
+except: customers_list = []
+if not customers_list: customers_list = ["عميل نقدي", "شركة دبي للمقاولات", "مصنع الألومنيوم"]
 
-                # --- برمجة التعديل ---
-                elif action == "تعديل البيانات ✏️":
-                    st.markdown("#### تعديل بيانات السجل")
-                    with st.form("edit_form"):
-                        try:
-                            p_date = datetime.strptime(
-                                curr_data.iloc[3], "%d-%b-%Y"
-                            ).date()
-                        except:
-                            p_date = datetime.today().date()
-                        try:
-                            p_tfrom = datetime.strptime(
-                                curr_data.iloc[7], "%H:%M"
-                            ).time()
-                        except:
-                            p_tfrom = datetime.now().time()
-                        try:
-                            p_tto = datetime.strptime(
-                                curr_data.iloc[8], "%H:%M"
-                            ).time()
-                        except:
-                            p_tto = datetime.now().time()
+vehicles_list = ["TRUCK - 7412", "PICKUP - 9632", "TESLA - 3", "HIACE - 8520"]
 
-                        d_opts = get_drivers()
-                        c_opts = get_customers()
-                        curr_driver = curr_data.iloc[1]
-                        curr_cust = curr_data.iloc[4]
+# ══════════════════════════════════════════════════════════════
+# نموذج تسجيل التحرك
+# ══════════════════════════════════════════════════════════════
+with st.expander("➕ تسجيل حركة سائق جديدة (New Dispatch Entry)", expanded=True):
+    with st.form("dispatch_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            st.text_input("👤 الموظف/ـة المسؤولة:", value=st.session_state['current_user_name'], disabled=True)
+            driver = st.selectbox("👷‍♂️ اختر السائق:", options=[""] + drivers_list)
+            vehicle = st.selectbox("🚛 السيارة:", options=[""] + vehicles_list)
 
-                        ec1, ec2, ec3, ec4 = st.columns(4)
-                        with ec1:
-                            e_driver = st.selectbox(
-                                "الاسم",
-                                options=d_opts,
-                                index=(
-                                    d_opts.index(curr_driver)
-                                    if curr_driver in d_opts
-                                    else 0
-                                ),
-                            )
-                        with ec2:
-                            e_car = st.text_input(
-                                "رقم السيارة", value=curr_data.iloc[2]
-                            )
-                        with ec3:
-                            e_date = st.date_input("التاريخ", value=p_date)
-                        with ec4:
-                            e_cust = st.selectbox(
-                                "العميل",
-                                options=c_opts,
-                                index=(
-                                    c_opts.index(curr_cust)
-                                    if curr_cust in c_opts
-                                    else 0
-                                ),
-                            )
+        with c2:
+            move_type = st.radio("📍 نوع الحركة:", options=["🚀 خروج للتوصيل (OUT)", "🏡 عودة للمصنع (IN)"], horizontal=True)
+            customer = st.selectbox("🏢 الوجهة / العميل:", options=[""] + customers_list)
+            area = st.text_input("المنطقة:", placeholder="مثال: دبي - القوز الصناعية")
 
-                        ec5, ec6, ec7, ec8 = st.columns(4)
-                        with ec5:
-                            e_do = st.text_input(
-                                "رقم التوصيل", value=curr_data.iloc[5]
-                            )
-                        with ec6:
-                            e_dest = st.text_input(
-                                "الموقع", value=curr_data.iloc[6]
-                            )
-                        with ec7:
-                            e_tfrom = st.time_input("الوقت من", value=p_tfrom)
-                        with ec8:
-                            e_tto = st.time_input("الوقت إلى", value=p_tto)
+        with c3:
+            coo_ref = st.text_input("📑 رقم طلبية COO:", placeholder="مثال: ORD-2026-881")
+            notes = st.text_area("✍️ ملاحظات الحمولة:", placeholder="اكتب أي تفاصيل إضافية هنا...", height=68)
 
-                        e_notes = st.text_input(
-                            "الملاحظات", value=curr_data.iloc[11]
-                        )
-                        save_edit = st.form_submit_button("💾 حفظ التعديلات")
+        save_btn = st.form_submit_button("ترحيل وحفظ في Google Drive 💾", use_container_width=True)
 
-                        if save_edit:
-                            t1 = datetime.combine(datetime.today(), e_tfrom)
-                            t2 = datetime.combine(datetime.today(), e_tto)
-                            if t2 < t1:
-                                t2 += timedelta(days=1)
-                            diff = t2 - t1
-                            e_total = f"{diff.seconds//3600:02d}:{(diff.seconds//60)%60:02d}"
+        if save_btn:
+            if not driver:
+                st.error("⚠️ يرجى تحديد اسم السائق!")
+            else:
+                new_row = pd.DataFrame({
+                    "Timestamp": [datetime.now().strftime("%d-%b-%Y %H:%M:%S")],
+                    "Driver_Name": [driver],
+                    "Movement_Type": [move_type],
+                    "Customer_Destination": [customer],
+                    "Area": [area],
+                    "Vehicle": [vehicle],
+                    "COO_Ref": [coo_ref],
+                    "Notes": [notes],
+                    "Logged_By": [st.session_state['current_user_name']]
+                })
+                updated_df = pd.concat([df_log, new_row], ignore_index=True)
+                conn.update(worksheet="Movement_Log", data=updated_df)
+                st.success(f"✅ تم تسجيل حركة السائق ({driver}) بنجاح!")
+                st.rerun()
 
-                            updated_row = [
-                                curr_data.iloc[0],
-                                e_driver,
-                                e_car,
-                                e_date.strftime("%d-%b-%Y"),
-                                e_cust,
-                                e_do,
-                                e_dest,
-                                e_tfrom.strftime("%H:%M"),
-                                e_tto.strftime("%H:%M"),
-                                e_total,
-                                "",
-                                e_notes,
-                                "",
-                                curr_data.iloc[13],
-                            ]
+# ══════════════════════════════════════════════════════════════
+# عرض الجدول الحي
+# ══════════════════════════════════════════════════════════════
+st.subheader("📊 الجدول المباشر لحركة السائقين (مرتبط بـ Google Sheet)")
 
-                            try:
-                                try:
-                                    sheet.update(
-                                        range_name=f"A{row_idx}:N{row_idx}",
-                                        values=[updated_row],
-                                    )
-                                except TypeError:
-                                    sheet.update(
-                                        f"A{row_idx}:N{row_idx}", [updated_row]
-                                    )
+f1, f2, f3 = st.columns([1, 1, 2])
+with f1: filter_type = st.selectbox("فلتر الاتجاه:", ["الكل", "🚀 خروج للتوصيل (OUT)", "🏡 عودة للمصنع (IN)"])
+with f2: filter_driver = st.selectbox("فلتر السائقين:", ["الكل"] + drivers_list)
 
-                                log_audit(
-                                    "تعديل سجل سائق",
-                                    f"Row: {row_idx} | SR: {curr_data.iloc[0]}",
-                                )
-                                st.success("تم التعديل بنجاح!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"خطأ أثناء التعديل: {e}")
-    else:
-        st.info("لا توجد بيانات مسجلة حتى الآن في الجدول.")
+filtered_df = df_log.copy()
+if filter_type != "الكل": filtered_df = filtered_df[filtered_df["Movement_Type"] == filter_type]
+if filter_driver != "الكل": filtered_df = filtered_df[filtered_df["Driver_Name"] == filter_driver]
+
+if not filtered_df.empty:
+    st.dataframe(
+        filtered_df.iloc[::-1],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Timestamp": "الوقت والتاريخ", "Driver_Name": "اسم السائق", "Movement_Type": "الحركة",
+            "Customer_Destination": "العميل / الوجهة", "Area": "المنطقة", "Vehicle": "السيارة",
+            "COO_Ref": "رقم الطلبية", "Notes": "البيان", "Logged_By": "المُدخلة"
+        }
+    )
+else:
+    st.info("📭 لا توجد سجلات تطابق الفلتر الحالي.")
